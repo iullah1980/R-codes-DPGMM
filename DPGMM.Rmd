@@ -1,0 +1,293 @@
+---
+title: "Dirichlet process Gaussian mixture model for clustering satellite images"
+author: "Insha Ullah"
+date: "March 15, 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+Some required R packages. 
+```{r}
+library(MCMCpack)
+# For parallel computation if you use Linux system you will need the following doMC package
+#library(doMC) 
+# For parallel computation if you use Windows you will need the following doSNOW package
+library(doSNOW) 
+# For parallel computation on both Linux and Windows you will need the following foreach package
+library(foreach) 
+library(plyr)
+```
+
+
+
+Following are the functions that will be called in the main function below to conduct MCMC.
+
+This function samples alpha: the Dirichlet concentration parameter. 
+```{r}
+sample_alpha <- function(kmax,aalpha,balpha,V) {
+  alpha=0
+  while(alpha==0){
+    alpha=rgamma(1,shape=aalpha+kmax-1,rate=balpha-sum(log(1-V[1:(kmax-1)])))
+  }
+  return(alpha)
+}
+```
+
+```{r}
+# This fuction is to sample the labels z and the mixing proportions pi=(pi_1,...,pi_k).
+# The function take data x (number of variables * number of observations), 
+# maximum number of clusters as kmax, clusters probabilities as pi0, 
+# mean mu (number of variables * number of clusters), 
+# covariance Sigma (number of variables * number of variables * number of clusters),
+# and alpha: the Dirichlet concentration parameter.
+# Note the variables are in rows of x and the observations are in columns.
+
+sample_zpidp <- function(x,kmax,pi0,mu,Sigma,alpha){
+  p <- nrow(x)
+  n <- ncol(x)
+  # first sample indicators for all data points:
+  lpi=log(pi0)
+  
+  probx=array(NA,dim=c(kmax,n)); lpi=log(pi0);
+  
+  for (j in 1:kmax){
+    probx[j,]= lpi[j]+logmvnormpdf(x, mu[, j],Sigma[ , ,j]);
+  } 
+  
+  probx=exp(probx-matrix(apply(probx,2,max),kmax,n,byrow=TRUE))
+  probx=probx/(matrix(apply(probx,2,sum),kmax,n,byrow=TRUE))
+  
+  z <- 1+apply(apply(probx,2,cumsum) <= matrix(runif(n),kmax,n,byrow=TRUE),2,sum); # Mn(1,probx)
+  nz <- apply(t(outer(z,1:kmax,'==')),1,sum)
+  
+  # This is bit is to deal with the label switching issue
+  snz <- sort(nz, decreasing = TRUE, index.return=TRUE)
+  nz <- snz$x
+  oldz=z;
+  for (j in 1:kmax){
+    z[which(snz$ix[j]==oldz)]=j;
+  }
+  
+  # number of clusters
+  k <- sum(nz!=0);
+  
+  
+  # then sample the pi probabilities
+  V=rep(0,kmax);
+  npi=rep(0,kmax);
+  
+  for (j in 1:(kmax-1)){
+    gamma1 <- 1+nz[j];
+    gamma2 <- alpha + sum(nz[(j+1):kmax]);
+    V[j]=1;
+    while(V[j]==1){
+      V[j]=rbeta(1,gamma1,gamma2);
+    }
+    
+    if (j==1){
+      npi[j] <- V[j]
+    } else {npi[j] <- V[j]*prod(1-V[1:(j-1)]);}
+    
+  }
+  V[kmax] <- 1;
+  npi[kmax] <- prod(1-V[1:(kmax-1)])
+  
+  
+  
+  results <- list()
+  results$z <- z
+  results$V <- V
+  results$pi0 <- npi
+  results$k <- k
+  return(results)
+}
+```
+
+The following function is to sample mean mu and covariance Sigma.
+
+```{r}
+sample_muSigma <- function(x,p,kmax,z,m0,t0,s0,S0, mu, Sigma){
+  #
+  # sample posterior for parameters of k normals given config indicators
+  # reference prior ...
+  
+  for (j in 1:kmax){
+    
+    i=which(z==j); 
+    nj=length(i); 
+    if (nj > 0) {
+      a = t0/(1+nj*t0); 
+      m = matrix(apply(x[,i,drop=FALSE],1,mean),p,1); 
+      e= x[,i,drop=FALSE]-matrix(m,p,nj); 
+      m=m-m0;
+      S = e%*%t(e)+m%*%t(m)*nj*a/t0; 
+      Sigma[ , , j] = riwish(s0+p-1+nj,S0+S);
+      mu[ , j] = a*nj*m+sqrt(a)*t(chol(Sigma[ , , j]))%*%matrix(rnorm(p),p,1); 
+    } else {
+      Sigma[ , , j] = riwish(s0+p-1,S0);
+      mu[ , j] = sqrt(t0)*t(chol(Sigma[ , , j]))%*%matrix(rnorm(p),p,1); 
+    }
+  }
+  
+  
+  results <- list()
+  results$mu <- mu
+  results$Sigma <- Sigma
+  return(results)
+}
+```
+
+The following function returns log likelihood of the of the observation given the parameters mu and Sigma.
+
+``` {r}
+logmvnormpdf <- function(x,mu,Sigma){
+  
+  # x  = p.n array of n values of p-dim MV normal
+  # mu = column p vector mean
+  # Sigma = p.p variance matrix 
+  # logpdf = n vector of log pdf values
+  #
+  p <- nrow(x)
+  n <- ncol(x)
+  C=chol(Sigma); e=t(solve(C))%*%(x-matrix(mu,p,n)); 
+  if (p==1){
+    q <- e^2
+  } else {q <- apply(e^2,2,sum)}
+  logpdf = -q/2 - sum(log(diag(C))) - log(2*base::pi)*(p/2);
+  return(logpdf)
+}
+
+```
+
+function to find mode.
+```{r}
+
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+```
+
+
+```{r}
+#update the stick-breaking parameters, v
+SB.V <- function(kmax,gamma1,gamma2){
+  V <- rep(1,kmax)
+  for(j in 1:(kmax-1)){
+    V[j] <- rbeta(1,gamma1,gamma2)
+  }
+  V
+}
+```
+
+```{r}
+#compute the stick-breaking weights
+pi_weights <- function(V){ 
+  kmax <- length(V)
+  probs <- V
+  probs[2:kmax] <- probs[2:kmax]*cumprod(1-V[2:kmax-1])
+  probs
+}
+```
+
+Blocked gibbs sampler.
+```{r}
+block_gibbs <- function(x){
+  
+  n <- dim(x)[2]
+  p <- dim(x)[1]
+  
+  nburnin <- 1000             #burn-in iterations
+  rsnmc <- 2000                 #mcmc iterations (post burn-in)
+  
+  k=30;
+  kmax=30 #maximum number of components in truncated dirichlet
+  
+  #initialize:
+  aalpha=0.0001; #dirichlet alpha priors
+  balpha=0.0001;
+  
+  m0=matrix(0,p,1); t0=15; s0=5; S0=s0*diag(p)/2;
+  
+  
+  V <- SB.V(kmax,gamma1=1,gamma2=1)
+  pi0 <- pi_weights(V)
+  
+  
+  mu <- array(NA,dim=c(p,k)); Sigma=array(NA,dim=c(p,p,k));
+  for (j in 1:k){
+    Sigma[ , , j]=S0/s0;
+    mu[ , j] = 0.2*sqrt(t0)*t(chol(Sigma[ , , j]))%*%matrix(rnorm(p),p,1);
+  }
+  
+  
+  #save thinned iterations:
+  mutotal <- array(0,dim=c(p,kmax,rsnmc));
+  Sigmatotal=array(0,dim=c(p,p,kmax,rsnmc));
+  pitotal=array(0,dim=c(kmax,rsnmc));
+  Vtotal=array(0,dim=c(kmax,rsnmc));
+  alphatotal=array(0,dim=c(1,rsnmc));
+  ktotal=array(0,dim=c(1,rsnmc));
+  ztotal=array(0,dim=c(ncol(x),rsnmc));
+  zsorted=array(0,dim=c(1,ncol(x)));
+  alpha=1;
+  
+  for (it in 1:(nburnin+rsnmc)){
+    if(it%%500==0){
+      cat("it=",it,"\n")
+    }
+    
+    zpidp <- sample_zpidp(x,kmax,pi0,mu,Sigma,alpha); 
+    z <- zpidp$z
+    pi0 <- zpidp$pi0
+    V <- zpidp$V
+    k <- zpidp$k
+    
+    nz <- apply(outer(z,1:kmax,'=='),2,sum)
+    
+    alpha <- sample_alpha(kmax,aalpha,balpha,V);
+    
+    muSigma <- sample_muSigma(x,p,kmax,z,m0,t0,s0,S0,mu,Sigma);
+    mu <- muSigma$mu
+    Sigma <- muSigma$Sigma
+    
+    if(it > nburnin){
+      saveit <- it-nburnin;
+      mutotal[ , , saveit] <- mu;
+      Sigmatotal[ , , ,saveit] <- Sigma;
+      ktotal[ , saveit] <- k;
+      alphatotal[ , saveit] <- alpha;
+      pitotal[ , saveit] <- pi0;
+      Vtotal[ , saveit] <- V;
+      ztotal[ , saveit] <- z;
+    }
+  }
+  
+  results <- list()
+  results$z <- apply(ztotal,1,getmode)
+  results$Kpost <- ktotal
+  results$alphapost <- alphatotal
+  results$mupost <- mutotal
+  results$Sigmapost <- Sigmatotal
+  results$pipost <- pitotal
+  results$Vpost <- Vtotal
+  return(results)
+}
+
+```
+
+Here we call the above functions 
+```{r,eval = FALSE}
+# load the data
+ant.data1 <- read.table(file = "/home/ullahi/image/Year0_NotStandardized.txt")
+ant.data.s1 <- ant.data1[,1:6] # 6 color bands of an image
+ant.data.s1 <- scale(ant.data.s1) # standardize variables to zero mean and unit variance
+ant.data.s1[is.na(ant.data.s1)]=0 # replace NAs by 0 or treat missing values the way you wish. Imagery data generally do not have missing value. 
+
+#rm(ant.data1)
+yy <- ant.data.s1
+#rm(ant.data.s1)
+DPGMM_res <- block_gibbs(t(yy))
+```
