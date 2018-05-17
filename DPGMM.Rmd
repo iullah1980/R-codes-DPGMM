@@ -279,15 +279,6 @@ block_gibbs <- function(x){
 ```
 
 Here we call the above functions 
-```{r,eval = FALSE}
-# load the data
-ant.data1 <- read.table(file = "/home/ullahi/image/Year0_NotStandardized.txt")
-ant.data.s1 <- ant.data1[,1:6] # 6 color bands of an image
-ant.data.s1 <- scale(ant.data.s1) # standardize variables to zero mean and unit variance
-ant.data.s1[is.na(ant.data.s1)]=0 # replace NAs by 0 or treat missing values the way you wish. Imagery data generally do not have missing value. 
 
-#rm(ant.data1)
-yy <- ant.data.s1
-#rm(ant.data.s1)
 DPGMM_res <- block_gibbs(t(yy))
 ```
